@@ -407,44 +407,32 @@ func (e *etcdClient) StatusCheckErrors() <-chan error {
 	return e.statusCheckErrors
 }
 
-func (e *etcdClient) waitForInitLock(ctx context.Context) <-chan error {
-	initLockSucceeded := make(chan error)
-
-	go func() {
-		for {
-			select {
-			case <-e.client.Ctx().Done():
-				initLockSucceeded <- fmt.Errorf("client context ended: %w", e.client.Ctx().Err())
-				close(initLockSucceeded)
-				return
-			case <-ctx.Done():
-				initLockSucceeded <- fmt.Errorf("caller context ended: %w", ctx.Err())
-				close(initLockSucceeded)
-				return
-			default:
-			}
-
-			if e.extraOptions != nil && e.extraOptions.NoLockQuorumCheck {
-				close(initLockSucceeded)
-				return
-			}
-
-			// Generate a random number so that we can acquire a lock even
-			// if other agents are killed while locking this path.
-			randNumber := strconv.FormatUint(rand.Uint64(), 16)
-			locker, err := e.LockPath(ctx, InitLockPath+"/"+randNumber)
-			if err == nil {
-				locker.Unlock(context.Background())
-				close(initLockSucceeded)
-				e.logger.Debug("Distributed lock successful, etcd has quorum")
-				return
-			}
-
-			time.Sleep(100 * time.Millisecond)
+func (e *etcdClient) maybeWaitForInitLock(ctx context.Context) error {
+	if e.extraOptions != nil && e.extraOptions.NoLockQuorumCheck {
+		return nil
+	}
+	limiter := newExpBackoffRateLimiter(e, "etcd-client-init-lock")
+	defer limiter.Reset()
+	for {
+		select {
+		case <-e.client.Ctx().Done():
+			return fmt.Errorf("client context ended: %w", e.client.Ctx().Err())
+		case <-ctx.Done():
+			return fmt.Errorf("caller context ended: %w", ctx.Err())
+		default:
 		}
-	}()
 
-	return initLockSucceeded
+		// Generate a random number so that we can acquire a lock even
+		// if other agents are killed while locking this path.
+		randNumber := strconv.FormatUint(rand.Uint64(), 16)
+		locker, err := e.LockPath(ctx, InitLockPath+"/"+randNumber)
+		if err == nil {
+			locker.Unlock(context.Background())
+			e.logger.Debug("Distributed lock successful, etcd has quorum")
+			return nil
+		}
+		limiter.Wait(ctx)
+	}
 }
 
 func (e *etcdClient) isConnectedAndHasQuorum(ctx context.Context) error {
@@ -466,8 +454,7 @@ func (e *etcdClient) isConnectedAndHasQuorum(ctx context.Context) error {
 		return fmt.Errorf("timeout while waiting for initial connection")
 	}
 
-	initLockSucceeded := e.waitForInitLock(ctxTimeout)
-	if err := <-initLockSucceeded; err != nil {
+	if err := e.maybeWaitForInitLock(ctxTimeout); err != nil {
 		recordQuorumError("lock timeout")
 		return fmt.Errorf("unable to acquire lock: %w", err)
 	}
@@ -481,6 +468,8 @@ func (e *etcdClient) isConnectedAndHasQuorum(ctx context.Context) error {
 func (e *etcdClient) Connected(ctx context.Context) <-chan error {
 	out := make(chan error)
 	go func() {
+		limiter := newExpBackoffRateLimiter(e, "etcd-client-connected")
+		defer limiter.Reset()
 		defer close(out)
 		for {
 			select {
@@ -495,7 +484,7 @@ func (e *etcdClient) Connected(ctx context.Context) <-chan error {
 			if e.isConnectedAndHasQuorum(ctx) == nil {
 				return
 			}
-			time.Sleep(100 * time.Millisecond)
+			limiter.Wait(ctx)
 		}
 	}()
 	return out
@@ -506,7 +495,8 @@ func (e *etcdClient) Connected(ctx context.Context) <-chan error {
 // connected with the kvstore.
 func (e *etcdClient) Disconnected() <-chan struct{} {
 	<-e.firstSession
-
+	limiter := newExpBackoffRateLimiter(e, "etcd-client-disconnected")
+	defer limiter.Reset()
 	for {
 		session, err := e.lockLeaseManager.GetSession(context.Background(), InitLockPath)
 		if err == nil {
@@ -514,7 +504,7 @@ func (e *etcdClient) Disconnected() <-chan struct{} {
 		}
 
 		e.logger.WithError(err).Warning("Failed to acquire lock session")
-		time.Sleep(100 * time.Millisecond)
+		limiter.Wait(context.TODO())
 	}
 }
 
@@ -708,6 +698,19 @@ func makeSessionName(sessionPrefix string, opts *ExtraOptions) string {
 	return sessionPrefix
 }
 
+func newExpBackoffRateLimiter(e *etcdClient, name string) backoff.Exponential {
+	errLimiter := backoff.Exponential{
+		Name: name,
+		Min:  50 * time.Millisecond,
+		Max:  1 * time.Minute,
+	}
+
+	if e != nil && e.extraOptions != nil {
+		errLimiter.NodeManager = backoff.NewNodeManager(e.extraOptions.ClusterSizeDependantInterval)
+	}
+	return errLimiter
+}
+
 func (e *etcdClient) sessionError() (err error) {
 	e.RWMutex.RLock()
 	err = e.sessionErr
@@ -793,15 +796,7 @@ func (e *etcdClient) watch(ctx context.Context, w *Watcher) {
 	// errLimiter is used to rate limit the retry of the first Get request in case an error
 	// has occurred, to prevent overloading the etcd server due to the more aggressive
 	// default rate limiter.
-	errLimiter := backoff.Exponential{
-		Name: "etcd-list-before-watch-error",
-		Min:  50 * time.Millisecond,
-		Max:  1 * time.Minute,
-	}
-
-	if e.extraOptions != nil {
-		errLimiter.NodeManager = backoff.NewNodeManager(e.extraOptions.ClusterSizeDependantInterval)
-	}
+	errLimiter := newExpBackoffRateLimiter(e, "etcd-list-before-watch-error")
 
 reList:
 	for {
