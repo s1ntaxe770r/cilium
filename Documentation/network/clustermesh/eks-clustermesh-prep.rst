@@ -119,7 +119,7 @@ Install cluster one
 
         Cluster_1_NGW_2=$(aws ec2 create-nat-gateway \
             --subnet-id $Cluster_1_Public_Subnet_2 \
-            --allocation-id ${EIP_ALLOCATION_ID_2} \
+            --allocation-id ${Cluster_1_EIP_2} \
             --tag-specifications "ResourceType=natgateway, Tags=[{Key=Name,Value=Cluster_1_NGW_2}]" \
             --query 'NatGateway.{NatGatewayId:NatGatewayId}' \
             --output text
